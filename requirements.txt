@@ -1,0 +1,5 @@
+# Install in every Nautobot web + worker environment
+netmiko>=4.7,<5
+# For APC NMC2 cards (ssh-rsa host keys, SHA-1 key exchange) paramiko 5 cannot connect at all.
+# Uncomment to pin the last compatible major version:
+# paramiko>=3.5,<5

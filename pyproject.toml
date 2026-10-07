@@ -1,0 +1,25 @@
+# This repository is a Nautobot Git-repository job source, not an installable package.
+# Runtime dependency for the Nautobot environment: see requirements.txt
+# Development / test dependencies: see requirements-dev.txt
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+extend-exclude = [".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+ignore = [
+    "RUF012",  # mutable class attributes (Nautobot Job vars / Meta)
+    "SIM105",  # contextlib.suppress is less readable in the runner's cleanup paths
+    "B904",    # raise ... from err: not useful in operator-facing error messages
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["jobs"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = [
+    "ignore:Use '__' to separate path components:DeprecationWarning",  # Nautobot wireless tables, not ours
+]
