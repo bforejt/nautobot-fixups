@@ -182,6 +182,7 @@ def run(nb, apc, **overrides):
         ssh_port=apc.port,
         netmiko_device_type="",
         send_method="prompt",
+        prompt_pattern="",
         error_pattern="",
         success_pattern="",
         warning_pattern="",

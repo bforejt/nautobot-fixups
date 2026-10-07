@@ -316,7 +316,19 @@ class SSHFixupEngine(Job):
         label="Send method",
         choices=SEND_METHOD_CHOICES,
         default="prompt",
-        description="How netmiko decides a command has finished.",
+        description=(
+            "How netmiko decides a command has finished. 'prompt' accepts the login prompt in any mode "
+            "(Switch#, Switch(config)#, [root@esxi:~]); 'timing' waits for output to stop."
+        ),
+    )
+    prompt_pattern = StringVar(
+        label="Prompt pattern (regex)",
+        required=False,
+        description=(
+            "Only for the 'prompt' send method: regex that means 'the prompt is back'. Leave blank to derive it from "
+            r"the prompt seen at login. Needed when commands change the prompt text itself, e.g. cd on ESXi/Linux: "
+            r"\[root@\S+\] $  or  root@\S+#\s*$"
+        ),
     )
     error_pattern = StringVar(
         label="Error pattern (regex)",
@@ -426,6 +438,7 @@ class SSHFixupEngine(Job):
             "ssh_port",
             "netmiko_device_type",
             "send_method",
+            "prompt_pattern",
             "error_pattern",
             "success_pattern",
             "warning_pattern",
@@ -664,6 +677,7 @@ class SSHFixupEngine(Job):
         ssh_port,
         netmiko_device_type,
         send_method,
+        prompt_pattern,
         error_pattern,
         success_pattern,
         warning_pattern,
@@ -702,6 +716,7 @@ class SSHFixupEngine(Job):
             ("warning", warning_pattern),
             ("mask", mask_pattern),
             ("deny", deny_pattern),
+            ("prompt", prompt_pattern),
         ):
             if pattern:
                 try:
@@ -852,6 +867,7 @@ class SSHFixupEngine(Job):
                         connect_retries=int(connect_retries or 0),
                         known_hosts_file=(known_hosts_file or "").strip() or None,
                         send_method=send_method or "prompt",
+                        prompt_pattern=(prompt_pattern or "").strip() or None,
                         error_pattern=error_pattern or None,
                         success_pattern=success_pattern or None,
                         warning_pattern=warning_pattern or None,

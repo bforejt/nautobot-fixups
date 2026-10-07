@@ -22,6 +22,7 @@ SNMP cannot set these settings, and config.ini uploads are the only alternative 
 ├── requirements.txt         # netmiko, for the Nautobot environment
 └── tests/
     ├── fake_apc_server.py   # paramiko-based fake APC NMC SSH server
+    ├── fake_shells.py       # fake IOS-XE, NX-OS, ESXi and Proxmox shells (prompt modes)
     ├── test_runner.py       # runner tests against the fake server (no database needed)
     ├── test_job_e2e.py      # opt-in: the real Job inside Nautobot (Postgres + Redis in Docker)
     └── e2e/run_e2e.sh       # one-shot script for the above
@@ -126,7 +127,8 @@ The form, in order:
 | Known hosts file | Path on the worker to an OpenSSH `known_hosts` file; when set, unknown or changed host keys are refused. Blank accepts any key. |
 | SSH port | Default 22. |
 | Netmiko device type | *Auto*: the Platform's netmiko driver, else `apc_aos` when the manufacturer/platform name contains APC or Schneider, else `generic`. A selection that resolves to more than one driver is refused unless you pick one. |
-| Send method | `prompt` (default): wait for the CLI prompt after each command. `timing`: wait for output to go quiet; needed for `reboot` + `YES`. |
+| Send method | `prompt` (default): wait for the prompt after each command, accepting it in any mode (`Switch#`, `Switch(config)#`, `[root@esxi:~]`). `timing`: wait for output to go quiet; needed for interactive confirmations such as `reboot` + `YES`. |
+| Prompt pattern | Optional regex meaning "the prompt is back", for the `prompt` method. Blank derives it from the login prompt. Needed when commands change the prompt text itself, e.g. `cd` on ESXi or Linux: `\[root@\S+\] $` or `root@\S+#\s*$`. |
 | Error pattern | A response matching it is a failed command. APC: `^E1\d{2}:` (E100-E108). |
 | Success pattern | A response **not** matching it is a failed command. APC: `^E00[012]:`. Catches a wrong platform or an empty response. |
 | Warning pattern | Logged as a warning, still OK. APC: `^E002:` (reboot required). |
@@ -244,11 +246,21 @@ ticked, and the deny pattern cleared (the re-login check is skipped on that run)
 ## Reusing the engine for other vendors
 
 Nothing in the job is APC-specific apart from the manufacturer-name heuristic that picks
-`apc_aos`. For Cisco/Arista/Juniper/Linux boxes: set `network_driver` on the Platform (or pick
-the netmiko device type in the form), choose the right Secrets Group, set the error/success
-patterns for that CLI (Cisco: error `^%`), optionally tick *Enter enable mode*, and paste the
-commands. `jobs/ssh_runner.py` has no Nautobot imports and can be used from scripts or Nornir
-tasks directly:
+`apc_aos`. Set `network_driver` on the Platform (or pick the netmiko device type in the form),
+choose the right Secrets Group, set the error/success patterns for that CLI, and paste the
+commands. The following are covered by tests against fake shells:
+
+| Platform | Driver | Notes |
+|---|---|---|
+| Cisco IOS-XE | `cisco_ios` / `cisco_xe` | `conf t` ... `end` / `write mem` work with the `prompt` method; the config-mode prompt is accepted automatically. Error pattern `^%`. Tick *Enter enable mode* (and put the enable secret in the Secrets Group) if the account lands at `>`. |
+| Cisco NX-OS | `cisco_nxos` | Same as IOS-XE; `copy running-config startup-config` waits for the prompt. |
+| VMware ESXi shell | `generic` | **Not** `linux`: that driver waits for a `$`/`#` prompt that ESXi's `[root@host:~] ` never shows. The derived prompt pattern handles the `]` terminator; use a *Prompt pattern* such as `\[root@\S+\] $` if your commands `cd`. |
+| Proxmox / Debian | `linux` | Works as-is; use a *Prompt pattern* such as `root@\S+#\s*$` if your commands `cd`. Avoid pagers and interactive prompts (`--no-pager`, `-y`). |
+
+Interactive confirmations (`reload`, `[confirm]`, `reboot` + `YES`) are the one shape the
+`prompt` method cannot wait for; use the `timing` method for those lines.
+`jobs/ssh_runner.py` has no Nautobot imports and can be used from scripts or Nornir tasks
+directly:
 
 ```python
 from jobs.ssh_runner import SessionSpec, run_session, PrintLogger

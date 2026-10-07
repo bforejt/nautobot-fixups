@@ -45,6 +45,7 @@ __all__ = [
     "legacy_ssh_support",
     "normalise_commands",
     "parse_commands",
+    "prompt_regex",
     "resolve_device_type",
     "run_session",
     "verify_login",
@@ -78,6 +79,7 @@ class SessionSpec:
     command_timeout: float = 30.0  # max seconds to wait for a response to one command
     conn_timeout: float = 15.0  # TCP / SSH banner / auth timeout
     send_method: str = "prompt"  # "prompt" (wait for prompt) or "timing" (wait for silence)
+    prompt_pattern: str | None = None  # regex meaning "the prompt is back"; blank = derived from the login prompt
     error_pattern: str | None = None  # regex; a matching response is logged as an error
     success_pattern: str | None = None  # regex; a response NOT matching it is logged as an error
     warning_pattern: str | None = None  # regex; a matching response is logged as a warning (still ok)
@@ -107,6 +109,8 @@ class SessionSpec:
             re.compile(self.warning_pattern)
         if self.success_pattern:
             re.compile(self.success_pattern)
+        if self.prompt_pattern:
+            re.compile(self.prompt_pattern)
         if self.connect_retries < 0:
             raise ValueError("connect_retries must be >= 0")
         if self.pause_seconds < 0:
@@ -372,6 +376,27 @@ def _scrub(text: str, *secrets: str) -> str:
     return text
 
 
+def prompt_regex(prompt: str) -> str:
+    """Pattern that matches the login prompt in any mode: base text, any suffix, the same terminator.
+
+    ``Switch#`` -> also matches ``Switch(config)#`` and ``Switch(config-if)#``; ``[root@esxi:~]`` -> ``[root@esxi:~]``
+    (its own ``]`` terminator, not a fixed ``#``/``>`` set). Prompts that embed the working directory still need an
+    operator-supplied ``prompt_pattern`` once a command changes directory.
+    """
+    if len(prompt) > 1:
+        return re.escape(prompt[:-1]) + r"\S*" + re.escape(prompt[-1]) + r"\s*$"
+    return re.escape(prompt) + r"\s*$"
+
+
+def _strip_trailing_prompt(text: str, pattern: str) -> str:
+    """Remove a trailing prompt line netmiko could not strip itself (custom prompt patterns, cwd prompts)."""
+    lines = text.rstrip("\r\n").split("\n")
+    last = lines[-1] if lines else ""
+    if last and (re.search(pattern, last) or re.search(pattern, last.rstrip())):
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
 def _channel_alive(conn) -> bool:
     """True while the SSH channel and transport are still open (a device can close them after a command)."""
     channel = getattr(conn, "remote_conn", None)
@@ -608,6 +633,9 @@ def run_session(spec: SessionSpec, log: SessionLogger | None = None) -> SessionR
         if prompt and not conn.base_prompt:
             # generic drivers never set base_prompt; netmiko needs it to strip the trailing prompt
             conn.base_prompt = prompt[:-1] if len(prompt) > 1 else prompt
+        expect = spec.prompt_pattern or (prompt_regex(prompt) if prompt else None)
+        if spec.prompt_pattern:
+            log.info(f"{label}: using prompt pattern {spec.prompt_pattern!r}")
         result.prompt = prompt
         result.host_key = _host_key_info(conn)
         log.info(f"connected to {label}; prompt detected: {prompt!r}" if prompt else f"connected to {label}")
@@ -641,12 +669,16 @@ def run_session(spec: SessionSpec, log: SessionLogger | None = None) -> SessionR
             raw_pos = len(raw_log.getvalue())
             try:
                 if send_method == "prompt":
+                    # expect the prompt in any mode (config/sub-mode suffixes) instead of the exact login prompt
                     out = conn.send_command(
                         cmd,
+                        expect_string=expect,
                         read_timeout=spec.command_timeout,
                         strip_prompt=True,
                         strip_command=True,
                     )
+                    if expect:
+                        out = _strip_trailing_prompt(str(out), expect)
                 else:
                     out = conn.send_command_timing(
                         cmd,

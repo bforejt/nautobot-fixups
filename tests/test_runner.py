@@ -441,3 +441,104 @@ def test_short_secret_values_are_masked(runner, apc):
 def test_spec_repr_hides_credentials(runner):
     spec = runner.SessionSpec(host="h", username="u", password="hunter2hunter2", secret="enable-me", commands=["x"])
     assert "hunter2hunter2" not in repr(spec) and "enable-me" not in repr(spec)
+
+
+# --------------------------------------------------------------------------- other vendors, prompt mode
+
+
+def shell_spec(runner, server, device_type, commands, **overrides):
+    params = dict(
+        host=server.host,
+        port=server.port,
+        username="apc",
+        password="apc",
+        label="shell",
+        device_type=device_type,
+        commands=commands,
+        pause_seconds=0,
+        conn_timeout=10,
+        command_timeout=6,
+        connect_retries=0,
+        logout_command="exit",
+    )
+    params.update(overrides)
+    return runner.SessionSpec(**params)
+
+
+def test_prompt_regex_derivation(runner):
+    import re
+
+    assert re.search(runner.prompt_regex("Switch#"), "Switch(config)#")
+    assert re.search(runner.prompt_regex("Switch#"), "Switch(config-if)#")
+    assert re.search(runner.prompt_regex("Switch#"), "...\nSwitch#")
+    assert not re.search(runner.prompt_regex("Switch#"), "hostname Switch\n")
+    assert re.search(runner.prompt_regex("[root@esxi:~]"), "[root@esxi:~] ")
+    assert not re.search(runner.prompt_regex("[root@esxi:~]"), "[root@esxi:/tmp] ")
+    assert re.search(runner.prompt_regex("apc>"), "apc>")
+
+
+def test_cisco_ios_config_mode_in_prompt_mode(runner):
+    from fake_shells import FakeIOSXE
+
+    cmds = ["conf t", "restconf", "netconf-yang", "end", "write mem", "show run | include restconf|netconf"]
+    with FakeIOSXE(name="sw1") as sw:
+        result = runner.run_session(shell_spec(runner, sw, "cisco_ios", cmds, error_pattern=r"^%"), None)
+        assert result.ok and result.sent == 6 and result.prompt == "Switch#"
+        assert sw.config == ["restconf", "netconf-yang"]
+        assert result.commands[0].response.startswith("Enter configuration commands")
+        assert result.commands[4].response == "Building configuration...\n[OK]"  # attributed to write mem itself
+        assert result.commands[5].response == "restconf\nnetconf-yang"
+
+
+def test_cisco_nxos_config_mode_in_prompt_mode(runner):
+    from fake_shells import FakeNXOS
+
+    cmds = ["conf t", "feature nxapi", "end", "copy running-config startup-config", "show feature | include nxapi"]
+    with FakeNXOS(name="n9k") as sw:
+        result = runner.run_session(shell_spec(runner, sw, "cisco_nxos", cmds, error_pattern=r"^%"), None)
+        assert result.ok and result.sent == 5
+        assert result.commands[3].response.endswith("Copy complete.")
+        assert "enabled" in result.commands[4].response
+
+
+def test_esxi_shell_needs_generic_driver_and_keeps_its_bracket_prompt(runner):
+    from fake_shells import FakeESXi
+
+    cmds = ["esxcli system settings advanced list -o /UserVars/ESXiShellTimeOut", "vim-cmd hostsvc/enable_ssh", "ls"]
+    with FakeESXi(name="esx") as esx:
+        result = runner.run_session(shell_spec(runner, esx, "generic", cmds, error_pattern=r"not found"), None)
+        assert result.ok and result.sent == 3 and result.prompt == "[root@esxi01:~]"
+        assert result.commands[0].response.startswith("Path: /UserVars/ESXiShellTimeOut")
+        assert result.commands[2].response == "altbootbank  bin  bootbank  dev  etc  lib  tmp  vmfs"
+
+
+def test_cwd_prompts_need_an_operator_prompt_pattern(runner):
+    from fake_shells import FakeESXi, FakeProxmox
+
+    with FakeESXi(name="esx") as esx:
+        result = runner.run_session(shell_spec(runner, esx, "generic", ["cd /tmp", "ls"]), None)
+        assert not result.ok and "no prompt within" in result.commands[0].error  # derived pattern no longer matches
+    with FakeESXi(name="esx") as esx:
+        result = runner.run_session(
+            shell_spec(runner, esx, "generic", ["cd /tmp", "ls"], prompt_pattern=r"\[root@\S+\] $"), None
+        )
+        assert result.ok and result.commands[0].response == ""
+        assert result.commands[1].response == "altbootbank  bin  bootbank  dev  etc  lib  tmp  vmfs"
+    with FakeProxmox(name="pve") as pve:
+        result = runner.run_session(
+            shell_spec(runner, pve, "linux", ["cd /etc/pve", "cat datacenter.cfg"], prompt_pattern=r"root@\S+#\s*$"),
+            None,
+        )
+        assert result.ok
+        assert result.commands[1].response == "# datacenter config\nkeyboard: en-us\n# end of file\nmigration: secure"
+
+
+def test_proxmox_linux_driver(runner):
+    from fake_shells import FakeProxmox
+
+    cmds = ["pvesh get /version --output-format json", "systemctl restart pveproxy", "cat datacenter.cfg"]
+    with FakeProxmox(name="pve") as pve:
+        result = runner.run_session(shell_spec(runner, pve, "linux", cmds, error_pattern=r"command not found"), None)
+        assert result.ok and result.sent == 3 and result.prompt == "root@pve1:~#"
+        assert result.commands[0].response.startswith('{"release":"8.3"')
+        assert result.commands[2].response.startswith("# datacenter config")
