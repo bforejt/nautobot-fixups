@@ -65,6 +65,10 @@ def nb():
     platform, _ = Platform.objects.get_or_create(name="APC AOS", defaults={"manufacturer": mfr})
     tag, _ = Tag.objects.get_or_create(name="e2e-apc-fixup")
     tag.content_types.add(ct_device)
+    pending, _ = Tag.objects.get_or_create(name="e2e-fixup-pending")
+    pending.content_types.add(ct_device)
+    done, _ = Tag.objects.get_or_create(name="e2e-fixup-done")
+    done.content_types.add(ct_device)
     ns = Namespace.objects.get(name="Global")
     Prefix.objects.get_or_create(prefix="127.0.0.0/8", namespace=ns, defaults={"status": active})
 
@@ -123,6 +127,8 @@ def nb():
     env.job_model = job_model
     env.sg = sg
     env.tag = tag
+    env.pending = pending
+    env.done = done
     env.loc = loc
     env.d1 = device("e2e-apc-1", "127.0.0.1", tagged=True)
     env.d2 = device("e2e-apc-2")  # no primary IP -> skipped in pre-flight
@@ -169,6 +175,8 @@ def run(nb, apc, **overrides):
         canary_count=1,
         max_device_failures=3,
         change_reference="CHG-0001",
+        remove_tag_on_success=None,
+        add_tag_on_success=None,
         secrets_group=nb.sg.pk,
         commands=COMMANDS,
         render_jinja=True,
@@ -398,3 +406,40 @@ def test_all_devices_skipped_is_a_failure(nb, apc):
     job_result, _, _ = run(nb, apc, devices=[nb.d2.pk], dryrun=True)  # no primary IP -> skipped
     assert_failed(job_result)
     assert "would be skipped" in job_result.result["exc_message"]
+
+
+def test_success_tags_are_flipped_only_for_ok_live_devices(nb, apc):
+    nb.d1.tags.add(nb.pending)
+    nb.d1.tags.remove(nb.done)
+    # dry run: nothing changes, log says what would happen
+    job_result, logs, files = run(
+        nb, apc, remove_tag_on_success=nb.pending.pk, add_tag_on_success=nb.done.pk, dryrun=True
+    )
+    assert job_result.status == "SUCCESS", job_result.result
+    assert nb.d1.tags.filter(pk=nb.pending.pk).exists() and not nb.d1.tags.filter(pk=nb.done.pk).exists()
+    assert any("would remove tag 'e2e-fixup-pending'" in m for m in messages(logs, grouping="e2e-apc-1"))
+    # failed device: tags untouched
+    job_result, _, _ = run(
+        nb, apc, remove_tag_on_success=nb.pending.pk, add_tag_on_success=nb.done.pk, error_pattern=APC_ERROR_PATTERN
+    )
+    assert_failed(job_result)
+    assert nb.d1.tags.filter(pk=nb.pending.pk).exists() and not nb.d1.tags.filter(pk=nb.done.pk).exists()
+    # live OK: pending removed, done added, recorded in log, summary and results
+    job_result, logs, files = run(nb, apc, remove_tag_on_success=nb.pending.pk, add_tag_on_success=nb.done.pk)
+    assert job_result.status == "SUCCESS", job_result.result
+    assert not nb.d1.tags.filter(pk=nb.pending.pk).exists() and nb.d1.tags.filter(pk=nb.done.pk).exists()
+    assert "removed tag 'e2e-fixup-pending'; added tag 'e2e-fixup-done'" in messages(logs, grouping="e2e-apc-1")
+    out = outcome(job_result, files)
+    assert out["devices"]["e2e-apc-1"]["tags"] == "removed tag 'e2e-fixup-pending'; added tag 'e2e-fixup-done'"
+    assert "tags: removed from 1, added to 1" in out["summary"]
+    # selecting by the pending tag now finds nothing left to do
+    job_result, _, _ = run(nb, apc, devices=[], tags=[nb.pending.pk])
+    assert_failed(job_result)
+    assert "No devices selected" in job_result.result["exc_message"]
+    nb.d1.tags.remove(nb.done)
+
+
+def test_success_tags_must_differ(nb, apc):
+    job_result, _, _ = run(nb, apc, remove_tag_on_success=nb.pending.pk, add_tag_on_success=nb.pending.pk)
+    assert_failed(job_result)
+    assert "must be different tags" in job_result.result["exc_message"]

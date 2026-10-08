@@ -147,6 +147,7 @@ class _Plan:
     display: list[str] = field(default_factory=list)
     secret_values: list[str] = field(default_factory=list)
     skip: str = ""  # non-empty = do not attempt (reason)
+    tag_note: str = ""  # what happened to the success tags for this device
 
 
 class SSHFixupEngine(Job):
@@ -205,6 +206,23 @@ class SSHFixupEngine(Job):
         label="Change reference",
         required=False,
         description="Ticket / change number, recorded in the log header and the results file.",
+    )
+    remove_tag_on_success = ObjectVar(
+        model=Tag,
+        label="Remove tag on success",
+        required=False,
+        query_params={"content_types": "dcim.device"},
+        description=(
+            "Remove this tag from each device whose run completed OK (live runs only). Use it as a 'still to do' "
+            "marker: tag the fleet, select by that tag, and finished devices drop out of the next run."
+        ),
+    )
+    add_tag_on_success = ObjectVar(
+        model=Tag,
+        label="Add tag on success",
+        required=False,
+        query_params={"content_types": "dcim.device"},
+        description="Add this tag to each device whose run completed OK (live runs only), e.g. a 'done' marker.",
     )
 
     # ---- credentials
@@ -435,6 +453,8 @@ class SSHFixupEngine(Job):
             "canary_count",
             "max_device_failures",
             "change_reference",
+            "remove_tag_on_success",
+            "add_tag_on_success",
             "secrets_group",
             "commands",
             "render_jinja",
@@ -656,6 +676,35 @@ class SSHFixupEngine(Job):
                 )
         return plans
 
+    def _apply_success_tags(self, device, remove_tag, add_tag, dryrun, extra):
+        """Flip the marker tags for a device that completed OK. Returns (failure, note)."""
+        notes = []
+        try:
+            if remove_tag is not None:
+                present = device.tags.filter(pk=remove_tag.pk).exists()
+                if dryrun:
+                    notes.append(f"would remove tag '{remove_tag}'" if present else f"tag '{remove_tag}' not present")
+                elif present:
+                    device.tags.remove(remove_tag)
+                    notes.append(f"removed tag '{remove_tag}'")
+                else:
+                    notes.append(f"tag '{remove_tag}' was not present")
+            if add_tag is not None:
+                present = device.tags.filter(pk=add_tag.pk).exists()
+                if dryrun:
+                    notes.append(f"would add tag '{add_tag}'" if not present else f"tag '{add_tag}' already present")
+                elif present:
+                    notes.append(f"tag '{add_tag}' already present")
+                else:
+                    device.tags.add(add_tag)
+                    notes.append(f"added tag '{add_tag}'")
+        except Exception as exc:  # the commands succeeded; the marker is wrong, which the operator must see
+            return f"commands OK but updating tags failed: {exc.__class__.__name__}: {exc}", "; ".join(notes)
+        note = "; ".join(notes)
+        if note:
+            self.logger.info("%s", note, extra=extra)
+        return "", note
+
     def _attach(self, filename: str, content: str) -> None:
         try:
             self.create_file(filename, content)
@@ -675,6 +724,8 @@ class SSHFixupEngine(Job):
         canary_count,
         max_device_failures,
         change_reference,
+        remove_tag_on_success,
+        add_tag_on_success,
         secrets_group,
         commands,
         render_jinja,
@@ -737,6 +788,11 @@ class SSHFixupEngine(Job):
                     raise RunJobTaskFailed(f"Invalid {label} pattern regex {pattern!r}: {exc}")
         if (netmiko_device_type or "").strip():
             resolve_device_type(netmiko_device_type)  # raises ValueError with a hint for unknown drivers
+        if remove_tag_on_success and add_tag_on_success and remove_tag_on_success.pk == add_tag_on_success.pk:
+            raise RunJobTaskFailed("'Remove tag on success' and 'Add tag on success' must be different tags.")
+        for tag in (remove_tag_on_success, add_tag_on_success):
+            if tag is not None and not tag.content_types.filter(app_label="dcim", model="device").exists():
+                raise RunJobTaskFailed(f"Tag '{tag}' is not enabled for devices (check its content types).")
         if secrets_group is not None:
             self._check_secrets_group(secrets_group)
 
@@ -929,6 +985,12 @@ class SSHFixupEngine(Job):
                 except Exception as exc:  # one broken device must not kill the fleet run
                     failure = f"unexpected error: {exc.__class__.__name__}: {exc}"
 
+                tag_note = ""
+                if not failure and (remove_tag_on_success or add_tag_on_success):
+                    failure, tag_note = self._apply_success_tags(
+                        device, remove_tag_on_success, add_tag_on_success, dryrun, extra
+                    )
+                    plan.tag_note = tag_note
                 results.append((plan, result, failure))
                 attempted = sum(1 for _p, _r, f in results if not f.startswith("skipped:"))
                 if failure:
@@ -976,15 +1038,24 @@ class SSHFixupEngine(Job):
             else:
                 status = "DRY RUN" if dryrun else "OK"
             detail = failure or (f"prompt {result.prompt!r}" if result and result.prompt else "")
+            if plan.tag_note and not failure:
+                detail = f"{detail}; {plan.tag_note}" if detail else plan.tag_note
             rows.append(
                 f"| {plan.device} | {plan.host or '-'} | {status} | {result.sent if result else 0} | "
                 f"{result.failed if result else 0} | {result.warned if result else 0} | "
                 f"{_mask(detail, mask_pattern).replace('|', '/')[:200]} |"
             )
         self.logger.info("\n\n%s", "\n".join(rows), extra=summary_extra)
+        removed = sum(1 for p, _r, f in results if not f and p.tag_note.startswith("removed tag"))
+        added = sum(1 for p, _r, f in results if not f and "added tag" in p.tag_note)
+        tag_summary = ""
+        if remove_tag_on_success or add_tag_on_success:
+            tag_summary = (
+                f"; tags: removed from {removed}, added to {added}" if not dryrun else "; tags unchanged (dry run)"
+            )
         summary = (
             f"{mode}: {ok_n} OK, {len(failed)} failed, {skipped_n} skipped, {not_attempted} not attempted "
-            f"(of {len(plans)} selected)"
+            f"(of {len(plans)} selected){tag_summary}"
         )
         outcome = {
             "mode": "dry-run" if dryrun else "live",
@@ -1019,6 +1090,7 @@ class SSHFixupEngine(Job):
                 "prompt": result.prompt if result else "",
                 "host_key": result.host_key if result else "",
                 "duration": result.duration if result else 0,
+                "tags": plan.tag_note,
                 "detail": _mask(failure, mask_pattern),
             }
         for plan in plans[len(results) :]:

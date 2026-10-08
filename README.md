@@ -115,6 +115,7 @@ The form, in order:
 | Canary devices | Run this many devices first (name order); if any fails, stop before the rest (default 1). |
 | Abort after N failed devices | Circuit breaker, default 3 (0 = never). Wrong credentials or a bad command list stop early; one dead PDU does not. |
 | Change reference | Free text recorded in the log header and results file. |
+| Remove tag on success / Add tag on success | Marker tags flipped on each device the moment its run completes OK (live runs only; failed, skipped and dry-run devices are never touched). You create the tags yourself; the job only adds or removes them. |
 | Secrets Group | See above. |
 | Commands | One per line, in order. Blank lines and `#`, `!`, `//` comments ignored. Windows line endings are converted; tabs, smart quotes, en/em dashes, invisible and non-ASCII characters are normalised and reported in the log. |
 | Render with Jinja2 | Each line is a template with `device`, `obj`, `secret()` and the Nautobot/netutils filters. An undefined name fails the run before anything is sent. |
@@ -172,6 +173,23 @@ The form, in order:
    duration). The Job Result is marked **failed** if any attempted device failed, the run was
    aborted, or every selected device was skipped; otherwise skipped devices (no primary IP,
    not Active, no Secrets Group at all) do not fail it.
+
+### Tracking what is still to do with a marker tag
+
+1. Create a tag such as `fixup-dns-2026q4` (content type Device) and apply it to the fleet with a
+   bulk edit.
+2. Run the job with **Tags** = that tag and **Remove tag on success** = that tag. Every device that
+   completes OK loses the tag at that moment, so an aborted or partially failed run still leaves
+   an accurate marker on each device.
+3. Re-run with the same inputs: only the devices that still carry the tag are selected. When the
+   selection comes back empty, the fix-up is done. Optionally set **Add tag on success** to a
+   "done" tag as well.
+
+The per-device log, the summary table and `ssh-fixup-results.json` all record what happened to
+the tags. If you select by a **dynamic group** that filters on the tag instead of by the tag
+directly, refresh the group (it caches its members) before the next run. A device whose commands
+succeeded but whose tag could not be updated is reported as failed so the marker is never
+silently wrong.
 
 ### Example: pointing APC management cards at new DNS/NTP/RADIUS/mail settings
 
