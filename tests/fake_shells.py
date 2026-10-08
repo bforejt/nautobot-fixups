@@ -186,3 +186,55 @@ class FakeProxmox(FakeShell):
         if t.startswith("cat datacenter.cfg"):
             return "# datacenter config\nkeyboard: en-us\n# end of file\nmigration: secure"
         return f"-bash: {t.split()[0]}: command not found"
+
+
+class FakeNMCEcho(base.FakeApcServer):
+    """APC NMC with the real card's echo style: no per-character echo; after Enter it prints
+    ``\r\napc>`` + the command line (optionally as a later chunk, wrapped, or not at all), then the response."""
+
+    def __init__(self, split_delay=0.0, echo=True, wrap=0, **kw):
+        super().__init__(**kw)
+        self.split_delay = split_delay  # seconds between "apc>" and the echoed command
+        self.echo = echo  # False: the card does not echo the command at all
+        self.wrap = wrap  # > 0: echo wrapped at this many columns
+
+    def _shell(self, chan):
+        chan.settimeout(30)
+        chan.sendall((base.BANNER_TEMPLATE.format(name=self.name) + base.PROMPT).encode())
+        buf = ""
+        while not self._stop.is_set():
+            try:
+                data = chan.recv(1024)
+            except Exception:
+                break
+            if not data:
+                break
+            for ch in data.decode(errors="replace"):
+                if ch in ("\r", "\n"):
+                    if ch == "\n" and buf == "" and getattr(self, "_last_was_cr", False):
+                        self._last_was_cr = False
+                        continue
+                    self._last_was_cr = ch == "\r"
+                    line, buf = buf, ""
+                    if line.strip():
+                        self.received.append(line)
+                    chan.sendall(b"\r\n" + base.PROMPT.encode())  # prompt re-printed first ...
+                    if self.split_delay and line.strip():
+                        time.sleep(self.split_delay)
+                    if self.echo and line:
+                        echoed = line
+                        if self.wrap:
+                            echoed = "\r\n".join(line[i : i + self.wrap] for i in range(0, len(line), self.wrap))
+                        chan.sendall(echoed.encode())  # ... then the command echo
+                    chan.sendall(b"\r\n")
+                    response = self._respond(line)
+                    if response is None:
+                        chan.sendall(b"Bye.\r\n")
+                        chan.close()
+                        return
+                    if response:
+                        chan.sendall((response + "\r\n\r\n").encode())
+                    chan.sendall(base.PROMPT.encode())
+                else:
+                    self._last_was_cr = False
+                    buf += ch  # no per-character echo

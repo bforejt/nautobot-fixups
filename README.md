@@ -129,7 +129,7 @@ The form, in order:
 | Known hosts file | Path on the worker to an OpenSSH `known_hosts` file; when set, unknown or changed host keys are refused. Blank accepts any key. |
 | SSH port | Default 22. |
 | Netmiko device type | *Auto*: the Platform's netmiko driver, else `apc_aos` when the manufacturer/platform name contains APC or Schneider, else `generic`. A selection that resolves to more than one driver is refused unless you pick one. |
-| Send method | `prompt` (default): wait for the prompt after each command, accepting it in any mode (`Switch#`, `Switch(config)#`, `[root@esxi:~]`). `timing`: wait for output to go quiet; needed for interactive confirmations such as `reboot` + `YES`. |
+| Send method | `prompt` (default): wait for the prompt after each command, accepting it in any mode (`Switch#`, `Switch(config)#`, `[root@esxi:~]`). The command echo is used for synchronisation when the device sends one, but a device that does not echo, or wraps the echo at its terminal width, still works. `timing`: wait for output to go quiet; needed for interactive confirmations such as `reboot` + `YES`. In both modes prompt re-prints and the echoed command are stripped from the logged response. |
 | Prompt pattern | Optional regex meaning "the prompt is back", for the `prompt` method. Blank derives it from the login prompt. Needed when commands change the prompt text itself, e.g. `cd` on ESXi or Linux: `\[root@\S+\] $` or `root@\S+#\s*$`. |
 | Error pattern | A response matching it is a failed command. APC: `^E1\d{2}:` (E100-E108). |
 | Success pattern | A response **not** matching it is a failed command. APC: `^E00[012]:`. Catches a wrong platform or an empty response. |
@@ -243,6 +243,10 @@ ticked, and the deny pattern cleared (the re-login check is skipped on that run)
   (`E101 Command not found`, `E102 Parameter Error`, ...). The job has no built-in knowledge of
   these; give it the three patterns above. Anchor on the line start: `E100` can appear inside a
   serial number.
+* Echo quirks: real cards do not echo keystrokes; after Enter they re-print `apc>` plus the
+  command, sometimes wrapped at the terminal width. The job tolerates all of that in both send
+  methods and logs "no recognisable echo ..." once per device when it had to rely on the prompt
+  alone. If a device still misbehaves, the `timing` send method is the fallback.
 * No SSH exec channel on NMC2: `ssh apc@card "dns -p ..."` does not work on NMC2 (Schneider
   support confirmed only NMC3 2.x+ supports it). netmiko uses an interactive shell, which works
   on both generations.

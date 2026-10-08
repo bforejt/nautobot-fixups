@@ -46,6 +46,7 @@ __all__ = [
     "SessionResult",
     "SessionSpec",
     "available_device_types",
+    "clean_response",
     "environment_summary",
     "legacy_ssh_support",
     "normalise_commands",
@@ -63,6 +64,9 @@ DEFAULT_DEVICE_TYPE = "apc_aos" if "apc_aos" in NETMIKO_CLASS_MAPPER else GENERI
 COMMENT_PREFIXES = ("#", "!", "//")
 SEND_METHODS = ("prompt", "timing")
 NO_OUTPUT = "<no output>"
+ECHO_WAIT = 2.0  # seconds to wait for a device to echo the command before carrying on without it
+GRACE_READ = 0.25  # settle time before trusting a prompt match that carried no response text
+POLL = 0.05
 
 
 # --------------------------------------------------------------------------- data
@@ -394,6 +398,103 @@ def prompt_regex(prompt: str) -> str:
     return re.escape(prompt) + r"\s*$"
 
 
+def _prompt_prefix(expect: str) -> str:
+    """The prompt pattern without its end anchor, for matching a prompt at the start of a line."""
+    return expect[:-1] if expect.endswith("$") else expect
+
+
+def _echo_regex(command: str) -> str:
+    """The command as echoed by a device, tolerating line breaks inserted by terminal-width wrapping."""
+    return r"[\r\n]*".join(re.escape(ch) for ch in command.strip())
+
+
+def clean_response(output: str, command: str, expect: str | None) -> str:
+    """Drop prompt re-prints and the command echo that some devices put in front of the real response.
+
+    Leading prompt-only lines, the echoed command (even wrapped across lines, with or without a prompt in
+    front of it) and a trailing prompt line are removed. Everything else is returned untouched.
+    """
+    text = output.replace("\r", "")
+    prefix = _prompt_prefix(expect) if expect else None
+    echo = re.compile(_echo_regex(command)) if command.strip() else None
+    prompt_line = re.compile(prefix + r"[ \t]*(?:\n|$)") if prefix else None
+    # leading junk: blank lines, prompt-only lines, the (possibly wrapped) echo with an optional prompt before it
+    while True:
+        stripped = text.lstrip("\n")
+        if stripped != text:
+            text = stripped
+            continue
+        if prompt_line is not None:
+            match = prompt_line.match(text)
+            if match:
+                text = text[match.end() :]
+                continue
+        if prefix is not None:
+            match = re.match(prefix, text)
+            if match and echo is not None and echo.match(text, match.end()):
+                text = text[echo.match(text, match.end()).end() :]
+                continue
+        if echo is not None:
+            match = echo.match(text)
+            if match and (match.end() == len(text) or text[match.end()] in "\n \t"):
+                text = text[match.end() :]
+                continue
+        break
+    lines = text.split("\n")
+    while lines and (not lines[-1].strip() or (expect and re.search(expect, lines[-1]))):
+        lines.pop()
+    return "\n".join(lines).strip()
+
+
+def _send_prompt_mode(conn, command: str, expect: str, timeout: float, state: dict) -> str:
+    """Write the command, softly sync on its echo, then wait for the prompt pattern.
+
+    netmiko's own send_command insists on seeing the exact echo first and gives up after 10 s; devices
+    that do not echo (or wrap the echo at the terminal width) then fail although the prompt comes back
+    fine. Here the echo is awaited for ECHO_WAIT seconds and otherwise skipped. The end-anchored prompt
+    pattern keeps us in sync either way; a match with no response text yet gets a short grace read so a
+    prompt the device re-prints *before* the response is not mistaken for the end of it.
+    """
+    conn.write_channel(command.rstrip() + conn.RETURN)
+    start = time.monotonic()
+    deadline = start + timeout
+    echo_deadline = start + min(ECHO_WAIT, timeout)
+    echo = re.compile(_echo_regex(command)) if command.strip() else None
+    output = ""
+    synced = echo is None
+    while True:
+        new = conn.read_channel()
+        if new:
+            output += new
+        now = time.monotonic()
+        if not synced:
+            match = echo.search(output)
+            if match:
+                output = output[match.end() :]
+                synced = True
+            elif now < echo_deadline:
+                time.sleep(POLL)
+                continue
+            else:
+                synced = True
+                state["echo_missing"] = state.get("echo_missing", 0) + 1
+        if re.search(expect, output):
+            if clean_response(output, command, expect):
+                return output
+            # prompt seen but no response text yet (a device that re-prints the prompt before answering, or
+            # prompt re-prints still in flight from prompt detection): wait for a quiet period, up to the deadline
+            time.sleep(GRACE_READ)
+            more = conn.read_channel()
+            if more:
+                output += more
+                if time.monotonic() <= deadline:
+                    continue
+            return output
+        if now > deadline:
+            raise ReadTimeout(f"Pattern not detected: {expect!r} in output.")
+        time.sleep(POLL)
+
+
 def _strip_trailing_prompt(text: str, pattern: str) -> str:
     """Remove a trailing prompt line netmiko could not strip itself (custom prompt patterns, cwd prompts)."""
     lines = text.rstrip("\r\n").split("\n")
@@ -654,6 +755,7 @@ def _run_session(spec: SessionSpec, log: SessionLogger, label: str) -> SessionRe
         expect = spec.prompt_pattern or (prompt_regex(prompt) if prompt else None)
         if spec.prompt_pattern:
             log.info(f"{label}: using prompt pattern {spec.prompt_pattern!r}")
+        echo_state: dict = {}
         result.prompt = prompt
         result.host_key = _host_key_info(conn)
         log.info(f"connected to {label}; prompt detected: {prompt!r}" if prompt else f"connected to {label}")
@@ -686,17 +788,9 @@ def _run_session(spec: SessionSpec, log: SessionLogger, label: str) -> SessionRe
             cr = CommandResult(command=cmd)
             raw_pos = len(raw_log.getvalue())
             try:
-                if send_method == "prompt":
-                    # expect the prompt in any mode (config/sub-mode suffixes) instead of the exact login prompt
-                    out = conn.send_command(
-                        cmd,
-                        expect_string=expect,
-                        read_timeout=spec.command_timeout,
-                        strip_prompt=True,
-                        strip_command=True,
-                    )
-                    if expect:
-                        out = _strip_trailing_prompt(str(out), expect)
+                if send_method == "prompt" and expect:
+                    # expect the prompt in any mode (config/sub-mode suffixes); echo sync is soft
+                    out = _send_prompt_mode(conn, cmd, expect, spec.command_timeout, echo_state)
                 else:
                     out = conn.send_command_timing(
                         cmd,
@@ -705,7 +799,7 @@ def _run_session(spec: SessionSpec, log: SessionLogger, label: str) -> SessionRe
                         strip_prompt=True,
                         strip_command=True,
                     )
-                cr.response = str(out).strip()
+                cr.response = clean_response(str(out), cmd, expect)
             except ReadTimeout as exc:
                 # netmiko discards what the device sent when it gives up; recover it from the session log
                 cr.response = _salvage_output(raw_log, raw_pos, cmd, conn)
@@ -777,6 +871,11 @@ def _run_session(spec: SessionSpec, log: SessionLogger, label: str) -> SessionRe
                 break
             if spec.pause_seconds and index < total:
                 time.sleep(spec.pause_seconds)
+        if echo_state.get("echo_missing"):
+            log.info(
+                f"{label}: no recognisable echo for {echo_state['echo_missing']} command(s) within {ECHO_WAIT:g}s; "
+                "responses were taken from the prompt alone"
+            )
     finally:
         if spec.logout_command and not result.error and not dropped_as_expected:
             try:

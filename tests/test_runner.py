@@ -616,3 +616,64 @@ def test_legacy_shim_against_real_openssh(runner):
         assert "Allow SHA-1 SSH algorithms" in result.error
     result = runner.run_session(spec(True), None)
     assert result.ok and result.commands[0].response == "ok" and result.host_key.startswith("ssh-rsa ")
+
+
+# --------------------------------------------------------------------------- real-NMC echo styles
+
+NMC_CMDS = [
+    "tcpip -d example.local",
+    "dns -p 10.0.0.3 -s 10.0.0.4 -d example.local",
+    "ntp -p 10.0.0.5 -s 10.0.0.6",
+    "about",
+]
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        {},  # prompt + echo in one chunk
+        {"split_delay": 0.5},  # prompt re-printed, echo arrives half a second later
+        {"echo": False},  # the card does not echo at all
+        {"wrap": 24},  # echo wrapped at the terminal width
+    ],
+    ids=["one-chunk", "split-echo", "no-echo", "wrapped-echo"],
+)
+@pytest.mark.parametrize("method", ["prompt", "timing"])
+def test_nmc_echo_styles_give_clean_responses(runner, variant, method):
+    from fake_shells import FakeNMCEcho
+
+    with FakeNMCEcho(name="nmc2", **variant) as nmc:
+        cap = Capture(runner)
+        result = runner.run_session(
+            shell_spec(
+                runner,
+                nmc,
+                "apc_aos",
+                NMC_CMDS,
+                send_method=method,
+                error_pattern=r"^E1\d{2}:",
+                success_pattern=r"^E00[012]:",
+            ),
+            cap.logger,
+        )
+        assert result.ok, [c.error for c in result.commands]
+        assert [c.response for c in result.commands] == ["E000: Success"] * 4
+        assert nmc.received == [*NMC_CMDS, "exit"]
+        if method == "prompt" and variant.get("echo") is False:
+            assert any("no recognisable echo" in m for m in cap.messages("info"))
+
+
+def test_clean_response_helper(runner):
+    expect = runner.prompt_regex("apc>")
+    assert (
+        runner.clean_response("apc>dns -p 1.1.1.1\nE000: Success\n\napc>", "dns -p 1.1.1.1", expect) == "E000: Success"
+    )
+    assert runner.clean_response("\napc>\nE000: Success\napc>", "about", expect) == "E000: Success"
+    assert runner.clean_response("line1\nline2\n", "x", expect) == "line1\nline2"
+    assert runner.clean_response("", "x", expect) == ""
+    assert runner.clean_response("Switch(config)#", "conf t", runner.prompt_regex("Switch#")) == ""
+    wrapped = "apc>dns -p 10.0.0.3 -s 10.0.\n0.4 -d example.local\nE000: Success\n\napc>"
+    assert runner.clean_response(wrapped, "dns -p 10.0.0.3 -s 10.0.0.4 -d example.local", expect) == "E000: Success"
+    assert (
+        runner.clean_response("E000: Success", "dns", expect) == "E000: Success"
+    )  # response starting like the command
