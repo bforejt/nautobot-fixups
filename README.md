@@ -34,7 +34,7 @@ SNMP cannot set these settings, and config.ini uploads are the only alternative 
 |---|---|---|
 | Nautobot | 2.x (developed and tested on 2.4.43) | Job API from `nautobot.apps.jobs` |
 | netmiko | >= 4.7, < 5 | 4.7 added the `apc_aos` driver. |
-| paramiko | installed by netmiko | **paramiko 5.0 removed the SHA-1 `ssh-rsa` signature algorithm and SHA-1 Diffie-Hellman** (RSA keys still work through `rsa-sha2-*`). NMC2 cards have been observed to sign only with `ssh-rsa` (one AOS 7.1.8 card, see the open questions in the APC doc) and old AOS 6.x offers only SHA-1 key exchange, so for NMC2 fleets install `netmiko[par4]` (paramiko 3.5-4.x) in the Nautobot environment. `pip install -r requirements.txt` alone pulls paramiko 5; verify on one card with `ssh -vv`. NMC3 negotiates ECDH and can use an ECDSA host key. |
+| paramiko | installed by netmiko (5.x is fine) | **paramiko 5.0 removed the SHA-1 `ssh-rsa` signature algorithm and SHA-1 Diffie-Hellman**, which old management cards such as APC NMC2 need. Tick **Allow SHA-1 SSH algorithms** on the job for those runs (see below); no downgrade of the Nautobot environment is required. |
 
 netmiko is **not** installed by Nautobot. Install it in the environment of every Nautobot
 web and worker process (`pip install -r requirements.txt` in the image or venv) or the job
@@ -124,6 +124,7 @@ The form, in order:
 | Command timeout | Seconds to wait for the prompt after a command (default 30). |
 | Connection timeout | TCP connect timeout (default 15); SSH banner and authentication get twice that, minimum 30 s. |
 | Connection retries | Extra attempts with 5 s doubling backoff on timeouts, early disconnects or a missing prompt (default 1). Never on authentication or algorithm failures. |
+| Allow SHA-1 SSH algorithms | Re-enables `ssh-rsa` host-key signatures and the SHA-1 Diffie-Hellman key exchanges (`group1`, `group14`, `group-exchange`) inside paramiko 5 **for this run only**. Modern algorithms stay preferred; a device that offers anything better still gets it. Off by default. |
 | Known hosts file | Path on the worker to an OpenSSH `known_hosts` file; when set, unknown or changed host keys are refused. Blank accepts any key. |
 | SSH port | Default 22. |
 | Netmiko device type | *Auto*: the Platform's netmiko driver, else `apc_aos` when the manufacturer/platform name contains APC or Schneider, else `generic`. A selection that resolves to more than one driver is refused unless you pick one. |
@@ -227,13 +228,19 @@ ticked, and the deny pattern cleared (the re-login check is skipped on that run)
 * No SSH exec channel on NMC2: `ssh apc@card "dns -p ..."` does not work on NMC2 (Schneider
   support confirmed only NMC3 2.x+ supports it). netmiko uses an interactive shell, which works
   on both generations.
-* Legacy crypto: NMC2 cards have been seen to sign only with `ssh-rsa` and, on old AOS 6.x
-  firmware, offer only SHA-1 Diffie-Hellman. paramiko 3.x/4.x accept those out of the box;
-  paramiko 5.0 cannot connect to such cards. A failure reads "SSH negotiation failed:
-  Incompatible ssh peer ..." and the log names the missing algorithms; the environment line at
-  the top of every run says up front whether the installed paramiko still has them. Nothing in
-  netmiko's `disabled_algorithms` or an ssh config file can add algorithms back, which is why
-  the job has no "legacy SSH" switch.
+* Legacy crypto: NMC2 cards sign only with `ssh-rsa` and, on old AOS 6.x firmware, offer only
+  SHA-1 Diffie-Hellman. paramiko 5.0 removed both, so a plain connection fails with
+  "SSH negotiation failed: Incompatible ssh peer (no acceptable kex algorithm / host key)".
+  Tick **Allow SHA-1 SSH algorithms** for those runs: the job re-adds the algorithms to paramiko
+  in the worker process for the duration of the run (the equivalent of OpenSSH's
+  `-oHostKeyAlgorithms=+ssh-rsa -oKexAlgorithms=+diffie-hellman-group14-sha1`), appended after
+  the modern algorithms, and removes them again afterwards. This is verified against an OpenSSH
+  server that offers only those algorithms (`tests/test_runner.py`, `LEGACY_SSHD=host:port`).
+  The alternative, if you would rather not have SHA-1 code in the worker at all, is a second
+  Celery worker in its own virtualenv with `netmiko[par4]` (paramiko 4) serving a dedicated task
+  queue, with this job pinned to that queue. SHA-1 signatures are deprecated because of
+  collision attacks; on an isolated management network against your own cards that is an
+  accepted risk, but upgrade the firmware where you can.
 * First login: NMC2 6.8+ and NMC3 force the Super User to change the default password on the
   first connection, and the CLI prompt never appears until that happens. The job reports this
   as "logged in but no CLI prompt appeared". Pre-provision new cards before fleet runs.

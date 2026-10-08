@@ -50,6 +50,9 @@ class FakeApcServer:
     # first token (lower-cased) -> canned response, or callable(line) -> response
     responses: dict[str, ResponseType] = field(default_factory=dict)
     received: list[str] = field(default_factory=list)
+    # restrict what the fake server offers, e.g. kex_algorithms=("diffie-hellman-group14-sha1",), key_types=("ssh-rsa",)
+    kex_algorithms: tuple = ()
+    key_types: tuple = ()
     sessions_opened: int = 0
     exec_requests: int = 0
 
@@ -112,6 +115,12 @@ class FakeApcServer:
     def _handle(self, client: socket.socket) -> None:
         transport = paramiko.Transport(client)
         try:
+            if self.kex_algorithms or self.key_types:
+                options = transport.get_security_options()
+                if self.kex_algorithms:
+                    options.kex = self.kex_algorithms
+                if self.key_types:
+                    options.key_types = self.key_types
             transport.add_server_key(self._host_key)
             iface = _ServerInterface(self)
             transport.start_server(server=iface)

@@ -46,6 +46,7 @@ from .ssh_runner import (
     SessionResult,
     SessionSpec,
     environment_summary,
+    legacy_algorithms_missing,
     normalise_commands,
     resolve_device_type,
     run_session,
@@ -285,6 +286,15 @@ class SSHFixupEngine(Job):
             "Extra connection attempts (5 s backoff, doubling) on timeouts or a missing prompt. Never on auth failures."
         ),
     )
+    legacy_ssh_algorithms = BooleanVar(
+        label="Allow SHA-1 SSH algorithms",
+        default=False,
+        description=(
+            "Re-enable ssh-rsa host-key signatures and SHA-1 Diffie-Hellman key exchange (removed in paramiko 5) "
+            "for this run only. Needed for old management cards such as APC NMC2. Modern algorithms are still "
+            "preferred when the device offers them."
+        ),
+    )
     known_hosts_file = StringVar(
         label="Known hosts file",
         required=False,
@@ -434,6 +444,7 @@ class SSHFixupEngine(Job):
             "command_timeout",
             "conn_timeout",
             "connect_retries",
+            "legacy_ssh_algorithms",
             "known_hosts_file",
             "ssh_port",
             "netmiko_device_type",
@@ -673,6 +684,7 @@ class SSHFixupEngine(Job):
         command_timeout,
         conn_timeout,
         connect_retries,
+        legacy_ssh_algorithms,
         known_hosts_file,
         ssh_port,
         netmiko_device_type,
@@ -759,6 +771,18 @@ class SSHFixupEngine(Job):
             extra=setup,
         )
         self.logger.info("%s", environment_summary(), extra=setup)
+        if legacy_ssh_algorithms:
+            missing = legacy_algorithms_missing()
+            if missing:
+                self.logger.warning(
+                    "SHA-1 SSH algorithms will be re-enabled for this run (%s); modern algorithms stay preferred",
+                    ", ".join(missing),
+                    extra=setup,
+                )
+            else:
+                self.logger.info(
+                    "installed paramiko already offers the SHA-1 algorithms; nothing to enable", extra=setup
+                )
         for note in notes:
             self.logger.warning("normalised %s", note, extra=setup)
         self.logger.info(
@@ -866,6 +890,7 @@ class SSHFixupEngine(Job):
                         conn_timeout=float(conn_timeout),
                         connect_retries=int(connect_retries or 0),
                         known_hosts_file=(known_hosts_file or "").strip() or None,
+                        legacy_ssh_algorithms=bool(legacy_ssh_algorithms),
                         send_method=send_method or "prompt",
                         prompt_pattern=(prompt_pattern or "").strip() or None,
                         error_pattern=error_pattern or None,

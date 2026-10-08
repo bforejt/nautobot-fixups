@@ -32,6 +32,11 @@ from netmiko.exceptions import (
 from netmiko.ssh_dispatcher import CLASS_MAPPER as NETMIKO_CLASS_MAPPER
 from paramiko.ssh_exception import SSHException
 
+try:  # loaded as part of the ``jobs`` package (Nautobot) ...
+    from .legacy_ssh import legacy_algorithms, legacy_algorithms_missing
+except ImportError:  # ... or standalone by path (tests, scripts) with jobs/ on sys.path
+    from legacy_ssh import legacy_algorithms, legacy_algorithms_missing  # noqa: F401 - re-exported
+
 __all__ = [
     "DEFAULT_DEVICE_TYPE",
     "GENERIC_DEVICE_TYPE",
@@ -92,6 +97,7 @@ class SessionSpec:
     disabled_algorithms: dict | None = None  # passed straight to paramiko (can only REMOVE algorithms)
     ssh_config_file: str | None = None  # netmiko only honours ProxyCommand/ProxyJump/Port/User/HostName from it
     known_hosts_file: str | None = None  # verify host keys against this file (netmiko ssh_strict); blank = accept any
+    legacy_ssh_algorithms: bool = False  # re-enable ssh-rsa + SHA-1 DH kex in paramiko 5 for this session
     keepalive: int = 30  # SSH keepalive seconds; helps long command lists survive idle gaps
     global_delay_factor: float = 1.0
     dry_run: bool = False  # connect, detect the prompt, send nothing
@@ -320,8 +326,8 @@ def environment_summary() -> str:
     )
     if not support["ssh-rsa"]:
         text += (
-            " - devices that only sign with ssh-rsa (e.g. APC NMC2 cards) cannot connect with this paramiko; "
-            "install 'netmiko[par4]' (paramiko<5) if the fleet contains them"
+            " - devices that only sign with ssh-rsa (e.g. APC NMC2 cards) need 'Allow SHA-1 SSH algorithms' "
+            "ticked (or paramiko<5 installed)"
         )
     return text
 
@@ -358,8 +364,8 @@ def _legacy_hint() -> str:
         return ""
     return (
         f" Installed paramiko {support['paramiko_version']} no longer offers {', '.join(missing)}; "
-        "legacy NMC2 firmware needs those. Either upgrade the device firmware or install "
-        "'paramiko<5' in the Nautobot environment."
+        "legacy NMC2 firmware needs those. Tick 'Allow SHA-1 SSH algorithms' for this run, upgrade the device "
+        "firmware, or install 'paramiko<5' in the Nautobot environment."
     )
 
 
@@ -550,6 +556,11 @@ def verify_login(spec: SessionSpec, log: SessionLogger | None = None) -> tuple[b
     """Log in once more (no commands) to prove the credentials still work, e.g. after RADIUS/user changes."""
     log = log or SessionLogger()
     label = spec.label or spec.host
+    with legacy_algorithms(spec.legacy_ssh_algorithms):
+        return _verify_login(spec, log, label)
+
+
+def _verify_login(spec: SessionSpec, log: SessionLogger, label: str) -> tuple[bool, str]:
     conn, error = _connect(spec, log, label, None)
     if conn is None:
         return False, error
@@ -584,6 +595,13 @@ def run_session(spec: SessionSpec, log: SessionLogger | None = None) -> SessionR
     """
     log = log or SessionLogger()
     label = spec.label or spec.host
+    with legacy_algorithms(spec.legacy_ssh_algorithms) as patched:
+        if patched:
+            log.info(f"{label}: SHA-1 SSH algorithms (ssh-rsa, DH group1/group14/gex-sha1) enabled for this session")
+        return _run_session(spec, log, label)
+
+
+def _run_session(spec: SessionSpec, log: SessionLogger, label: str) -> SessionResult:
     device_type = resolve_device_type(spec.device_type)
     result = SessionResult(host=spec.host, label=label, device_type=device_type, dry_run=spec.dry_run)
     transcript: list[str] = [

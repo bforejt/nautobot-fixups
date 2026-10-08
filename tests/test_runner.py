@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 APC_ERROR_PATTERN = r"^E1\d{2}:"
@@ -542,3 +544,75 @@ def test_proxmox_linux_driver(runner):
         assert result.ok and result.sent == 3 and result.prompt == "root@pve1:~#"
         assert result.commands[0].response.startswith('{"release":"8.3"')
         assert result.commands[2].response.startswith("# datacenter config")
+
+
+# --------------------------------------------------------------------------- legacy SHA-1 algorithms (paramiko 5)
+
+LEGACY_KEX = ("diffie-hellman-group14-sha1",)
+
+
+def test_legacy_shim_is_reverted_after_use(runner):
+    import sys
+
+    legacy = sys.modules["legacy_ssh"]
+    from paramiko.transport import Transport
+
+    before_kex, before_keys = Transport._preferred_kex, Transport._preferred_keys
+    missing = legacy.legacy_algorithms_missing()
+    with legacy.legacy_algorithms() as active:
+        assert active == bool(missing)
+        if active:
+            assert "ssh-rsa" in Transport._preferred_keys and Transport._preferred_keys[0] != "ssh-rsa"
+            assert Transport._preferred_kex[-3:] == tuple(k.name for k in legacy.LEGACY_KEX)
+            with legacy.legacy_algorithms():  # re-entrant
+                pass
+            assert "ssh-rsa" in Transport._key_info
+    assert Transport._preferred_kex == before_kex and Transport._preferred_keys == before_keys
+    assert legacy.legacy_algorithms_missing() == missing
+
+
+def test_legacy_only_server_needs_the_shim(runner):
+    import sys
+
+    from fake_apc_server import FakeApcServer
+
+    legacy = sys.modules["legacy_ssh"]
+    if not legacy.legacy_algorithms_missing():
+        pytest.skip("installed paramiko still ships the SHA-1 algorithms")
+    # the fake server is paramiko too, so it can only *offer* the legacy algorithms while the shim is active
+    # (which also patches the client in this process; the negative case is covered against real OpenSSH below)
+    with legacy.legacy_algorithms(), FakeApcServer(kex_algorithms=LEGACY_KEX, key_types=("ssh-rsa",)) as apc:
+        cap = Capture(runner)
+        result = runner.run_session(base_spec(runner, apc, commands=["about"], legacy_ssh_algorithms=True), cap.logger)
+        assert result.ok and result.host_key.startswith("ssh-rsa SHA256:")  # SHA-1 signature verified
+        ok, error = runner.verify_login(base_spec(runner, apc, commands=[], legacy_ssh_algorithms=True), None)
+        assert ok, error
+
+
+@pytest.mark.skipif(
+    not os.environ.get("LEGACY_SSHD"),
+    reason="set LEGACY_SSHD=host:port to an OpenSSH server offering only ssh-rsa + SHA-1 kex",
+)
+def test_legacy_shim_against_real_openssh(runner):
+    import sys
+
+    host, port = os.environ["LEGACY_SSHD"].rsplit(":", 1)
+
+    def spec(flag):
+        return runner.SessionSpec(
+            host=host,
+            port=int(port),
+            username="apc",
+            password="apc",
+            device_type="linux",
+            commands=["echo ok"],
+            connect_retries=0,
+            legacy_ssh_algorithms=flag,
+        )
+
+    if sys.modules["legacy_ssh"].legacy_algorithms_missing():
+        result = runner.run_session(spec(False), None)
+        assert not result.connected and "SSH negotiation failed" in result.error
+        assert "Allow SHA-1 SSH algorithms" in result.error
+    result = runner.run_session(spec(True), None)
+    assert result.ok and result.commands[0].response == "ok" and result.host_key.startswith("ssh-rsa ")

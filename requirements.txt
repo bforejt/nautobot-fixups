@@ -1,5 +1,6 @@
 # Install in every Nautobot web + worker environment
 netmiko>=4.7,<5
-# For APC NMC2 cards (ssh-rsa host keys, SHA-1 key exchange) paramiko 5 cannot connect at all.
-# Uncomment to pin the last compatible major version:
+# paramiko 5 (what netmiko pulls today) is fine: the job can re-enable the SHA-1 algorithms
+# old APC NMC2 cards need per run ("Allow SHA-1 SSH algorithms"). Pin paramiko<5 only if you
+# prefer the library to ship them natively:
 # paramiko>=3.5,<5

@@ -178,6 +178,7 @@ def run(nb, apc, **overrides):
         command_timeout=10,
         conn_timeout=3,
         connect_retries=0,
+        legacy_ssh_algorithms=False,
         known_hosts_file="",
         ssh_port=apc.port,
         netmiko_device_type="",
